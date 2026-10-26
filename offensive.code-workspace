@@ -1,0 +1,24 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"terminal.integrated.defaultProfile.linux": "bash",
+		"terminal.integrated.enablePersistentSessions": false,
+		"terminal.integrated.confirmOnExit": "always",
+		"debug.allowBreakpointsEverywhere": false,
+		"debug.javascript.autoAttachFilter": "disabled",
+		"git.confirmSync": true,
+		"git.allowForcePush": false,
+		"git.useForcePushWithLease": true,
+		"redhat.telemetry.enabled": false,
+		"search.followSymlinks": false,
+		"files.associations": {
+			"*.sh": "shellscript",
+			"*.j2": "jinja",
+			"Makefile.*": "makefile"
+		}
+	}
+}
