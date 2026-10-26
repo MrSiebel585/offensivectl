@@ -1,0 +1,2040 @@
+#!/usr/bin/env bash
+# Kali OSINT/DFIR Modules Control Plane
+# Usage: offensivectl [command] [options]
+#
+# Install location:
+#   /opt/offensive/offensivectl
+#
+# Symlink:
+#   /usr/local/bin/offensivectl -> /opt/offensive/offensivectl
+
+set -euo pipefail
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE_PATH" ]]; do
+    SOURCE_DIR="$(cd -P -- "$(dirname -- "$SOURCE_PATH")" && pwd)"
+    SOURCE_PATH="$(readlink -- "$SOURCE_PATH")"
+    [[ "$SOURCE_PATH" != /* ]] && SOURCE_PATH="$SOURCE_DIR/$SOURCE_PATH"
+done
+
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "$SOURCE_PATH")" && pwd)"
+readonly SCRIPT_DIR
+readonly ROOT_DIR="${OFFENSIVECTL_ROOT:-$SCRIPT_DIR}"
+readonly MODULES_DIR="$ROOT_DIR/modules"
+readonly PROFILES_DIR="$ROOT_DIR/profiles"
+readonly REPORTS_DIR="$ROOT_DIR/reports"
+readonly LOGS_DIR="$ROOT_DIR/logs"
+readonly REGISTRY_DIR="$ROOT_DIR/registry"
+readonly OFFENSIVE_BIN="${OFFENSIVECTL_BIN:-$ROOT_DIR/bin}"
+if [[ -n "${OFFENSIVECTL_LOCAL_BIN:-}" ]]; then
+    readonly USER_LOCAL_BIN="$OFFENSIVECTL_LOCAL_BIN"
+elif [[ -n "${HOME:-}" ]]; then
+    readonly USER_LOCAL_BIN="$HOME/.local/bin"
+else
+    readonly USER_LOCAL_BIN=""
+fi
+
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+    readonly RED=$'\033[31m'
+    readonly GREEN=$'\033[32m'
+    readonly YELLOW=$'\033[33m'
+    readonly BLUE=$'\033[34m'
+    readonly NC=$'\033[0m'
+else
+    readonly RED=""
+    readonly GREEN=""
+    readonly YELLOW=""
+    readonly BLUE=""
+    readonly NC=""
+fi
+# shellcheck disable=SC2034
+readonly OFFENSIVECTL_VERSION="1.2.0"
+
+if [[ -d "$OFFENSIVE_BIN" && ":$PATH:" != *":$OFFENSIVE_BIN:"* ]]; then
+    export PATH="$OFFENSIVE_BIN:$PATH"
+fi
+
+if [[ -n "$USER_LOCAL_BIN" && -d "$USER_LOCAL_BIN" && ":$PATH:" != *":$USER_LOCAL_BIN:"* ]]; then
+    export PATH="$USER_LOCAL_BIN:$PATH"
+fi
+
+builtin_command_catalog() {
+    cat <<'CATALOG'
+list|List available modules
+run MODULE|Run a module
+profile NAME|Run a profile
+report|Generate a case report
+status|Show local service and workspace status
+services status|Alias for status
+dirs|Discover top-level workspace directories
+interfaces|List/run UI or inspect network interfaces
+launchers|List dynamically discovered launchers
+load NAME|Run a dynamically discovered launcher
+discover|Show directories, modules, and interfaces
+doctor|Check installation health
+registry|Rebuild/show the module registry
+results|List and clean saved quick-results files
+ai|Use the local Ollama assistant
+lms|Manage the local LM Studio helper and API
+quick|Run a bounded one-line workflow
+kali|Proxy to kali-ones-offensive and Kali one-liners
+kali-ones|Proxy to kali-ones-offensive
+vuln|Governed local vulnerability-research workspace
+help|Show this help
+CATALOG
+}
+
+first_runnable_module_name() {
+    local module_yaml module_dir
+    local fallback=""
+    local mode risk
+    while IFS= read -r -d '' module_yaml; do
+        module_dir="${module_yaml%/module.yaml}"
+        if [[ -f "$module_dir/module.sh" ]]; then
+            [[ -n "$fallback" ]] || fallback="$(module_name_from_dir "$module_dir")"
+            mode="$(yaml_value mode "$module_yaml")"
+            risk="$(yaml_value risk_level "$module_yaml")"
+            if [[ "$mode" == "passive" && "$risk" == "low" ]]; then
+                module_name_from_dir "$module_dir"
+                return 0
+            fi
+        fi
+    done < <(module_manifest_files)
+    [[ -n "$fallback" ]] || return 1
+    printf '%s\n' "$fallback"
+}
+
+profile_names() {
+    local profile_file
+    [[ -d "$PROFILES_DIR" ]] || return 0
+    while IFS= read -r -d '' profile_file; do
+        basename -- "$profile_file" .yaml
+    done < <(
+        find -P "$PROFILES_DIR" -maxdepth 1 -type f -name '*.yaml' \
+            -print0 2>/dev/null | LC_ALL=C sort -z
+    )
+}
+
+usage() {
+    local command_name description record path kind name
+    local module_example=""
+    local profile_example=""
+    local launcher_example=""
+    local profiles_text=""
+    local -a profiles=()
+    local -a launchers=()
+
+    printf 'Usage: offensivectl <command> [options]\n\n'
+    printf 'Built-in Commands\n'
+    printf '=================\n'
+    while IFS='|' read -r command_name description; do
+        printf '  %-20s %s\n' "$command_name" "$description"
+    done < <(builtin_command_catalog)
+
+    printf '\nDiscovered Launcher Commands\n'
+    printf '============================\n'
+    while IFS= read -r -d '' name; do
+        record="$(resolve_interface "$name")" || continue
+        path="${record#*|}"
+        kind="$(interface_kind "$name" "$path")"
+        printf '  %-20s Launch %s interface\n' "$name" "$kind"
+        launchers+=("$name")
+    done < <(runnable_interface_names)
+    [[ "${#launchers[@]}" -gt 0 ]] \
+        || printf '  %-20s %s\n' "(none)" "No runnable interfaces discovered"
+
+    mapfile -t profiles < <(profile_names)
+    printf '\nWorkspace Inventory\n'
+    printf '===================\n'
+    printf '  Runnable modules: %s\n' "$(count_runnable_modules)"
+    if [[ "${#profiles[@]}" -gt 0 ]]; then
+        for name in "${profiles[@]}"; do
+            profiles_text+="${profiles_text:+, }$name"
+        done
+        printf '  Profiles:         %s\n' "$profiles_text"
+    else
+        printf '  Profiles:         none\n'
+    fi
+    printf '  Launchers:        %s\n' "${#launchers[@]}"
+
+    module_example="$(first_runnable_module_name || true)"
+    profile_example="${profiles[0]:-}"
+    for name in "${profiles[@]}"; do
+        if [[ "$name" == "passive" ]]; then
+            profile_example="$name"
+            break
+        fi
+    done
+    launcher_example="${launchers[0]:-}"
+
+    printf '\nExamples Generated From This Workspace\n'
+    printf '======================================\n'
+    printf '  offensivectl list\n'
+    if [[ -n "$module_example" ]]; then
+        printf '  offensivectl run %s --target TARGET --case CASE-001 --authorization TOKEN\n' \
+            "$module_example"
+    fi
+    if [[ -n "$profile_example" ]]; then
+        printf '  offensivectl profile %s --target TARGET --case CASE-001 --authorization TOKEN\n' \
+            "$profile_example"
+    fi
+    printf '  offensivectl launchers\n'
+    if [[ -n "$launcher_example" ]]; then
+        printf '  offensivectl load %s --help\n' "$launcher_example"
+        printf '  offensivectl %s --help\n' "$launcher_example"
+    fi
+    printf '  offensivectl status --strict\n'
+}
+
+workspace_dir_class() {
+    case "$1" in
+        bin|sbin|core|modules|services|interfaces|integrations|config|profiles|\
+        registry|workflows|templates|share|docs|tests|scripts)
+            printf 'framework\n'
+            ;;
+        var|workspace|engagements|evidence|outputs|reports|logs|captures|results|\
+        labs|backups|cache|tmp)
+            printf 'runtime\n'
+            ;;
+        vendors|environments|venv|packages|plugins)
+            printf 'managed\n'
+            ;;
+        archive|legacy)
+            printf 'archive\n'
+            ;;
+        *)
+            printf 'other\n'
+            ;;
+    esac
+}
+
+cmd_dirs() {
+    local directory name class
+    local count=0
+
+    printf 'Workspace Directories\n'
+    printf '=====================\n'
+    printf 'Root: %s\n\n' "$ROOT_DIR"
+    printf '%-26s %-12s %s\n' "NAME" "CLASS" "PATH"
+    printf '%-26s %-12s %s\n' "--------------------------" "------------" "----"
+
+    while IFS= read -r -d '' directory; do
+        name="$(basename -- "$directory")"
+        class="$(workspace_dir_class "$name")"
+        printf '%-26s %-12s %s\n' "$name" "$class" "$directory"
+        count=$((count + 1))
+    done < <(
+        find -P "$ROOT_DIR" -mindepth 1 -maxdepth 1 -type d \
+            ! -name '.*' ! -name __pycache__ -print0 2>/dev/null \
+            | LC_ALL=C sort -z
+    )
+
+    printf '\nDiscovered: %s directories\n' "$count"
+}
+
+interface_search_dirs() {
+    local directory
+    local -a configured_directories=()
+
+    printf '%s\0' "$ROOT_DIR/interfaces/launchers"
+    if [[ -n "${OFFENSIVECTL_INTERFACE_PATH:-}" ]]; then
+        IFS=: read -r -a configured_directories \
+            <<< "$OFFENSIVECTL_INTERFACE_PATH"
+        for directory in "${configured_directories[@]}"; do
+            [[ -n "$directory" ]] && printf '%s\0' "$directory"
+        done
+    fi
+}
+
+dynamic_interface_names() {
+    local directory candidate name
+
+    while IFS= read -r -d '' directory; do
+        [[ -d "$directory" ]] || continue
+        for candidate in "$directory"/*; do
+            [[ -f "$candidate" && -x "$candidate" ]] || continue
+            name="$(basename -- "$candidate")"
+            [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
+            printf '%s\0' "$name"
+        done
+    done < <(interface_search_dirs) | LC_ALL=C sort -zu
+}
+
+runnable_interface_names() {
+    local name
+    local -a core_names=(control-plane dashboard bettercap-tui scapy-tui)
+
+    {
+        for name in "${core_names[@]}"; do
+            resolve_interface "$name" >/dev/null 2>&1 && printf '%s\0' "$name"
+        done
+        dynamic_interface_names
+    } | LC_ALL=C sort -zu
+}
+
+resolve_dynamic_interface() {
+    local name="$1"
+    local directory candidate
+
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+    while IFS= read -r -d '' directory; do
+        candidate="$directory/$name"
+        if [[ -f "$candidate" && -x "$candidate" ]]; then
+            printf 'exec|%s\n' "$candidate"
+            return 0
+        fi
+    done < <(interface_search_dirs)
+    return 1
+}
+
+resolve_interface() {
+    local name="$1"
+    local candidate
+
+    case "$name" in
+        metasploit-streamlit|msf-dashboard) name="metasploit-dashboard" ;;
+    esac
+
+    case "$name" in
+        control-plane|control|menuctl)
+            for candidate in \
+                "$ROOT_DIR/interfaces/cli/offensivemenuctl/control_plane.py" \
+                "$ROOT_DIR/control_plan/control_plane.py"; do
+                [[ -f "$candidate" ]] && { printf 'python|%s\n' "$candidate"; return 0; }
+            done
+            ;;
+        dashboard|web)
+            for candidate in \
+                "$ROOT_DIR/run_offensive_dashboard.sh" \
+                "$ROOT_DIR/dashboard/offensive_dashboard.sh"; do
+                [[ -f "$candidate" ]] && { printf 'bash|%s\n' "$candidate"; return 0; }
+            done
+            candidate="$ROOT_DIR/dashboard/offensive_dashboard.py"
+            [[ -f "$candidate" ]] && { printf 'python|%s\n' "$candidate"; return 0; }
+            ;;
+        bettercap-tui|bettercap)
+            candidate="$ROOT_DIR/bettercap-tui"
+            [[ -x "$candidate" ]] && { printf 'exec|%s\n' "$candidate"; return 0; }
+            candidate="$ROOT_DIR/bettercap_tui.py"
+            [[ -f "$candidate" ]] && { printf 'python|%s\n' "$candidate"; return 0; }
+            ;;
+        scapy-tui|scapy)
+            candidate="$ROOT_DIR/scapy-tui"
+            [[ -x "$candidate" ]] && { printf 'exec|%s\n' "$candidate"; return 0; }
+            candidate="$ROOT_DIR/scapy_tui.py"
+            [[ -f "$candidate" ]] && { printf 'python|%s\n' "$candidate"; return 0; }
+            ;;
+    esac
+
+    resolve_dynamic_interface "$name"
+}
+
+interface_kind() {
+    local name="$1"
+    local path="$2"
+    local kind=""
+
+    case "$name" in
+        control-plane) kind="service" ;;
+        dashboard) kind="web" ;;
+        bettercap-tui|scapy-tui) kind="tui" ;;
+        *)
+            kind="$(
+                awk -F= '
+                    /^#[[:space:]]*OFFENSIVECTL_KIND=/ {
+                        value=$2
+                        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                        print value
+                        exit
+                    }
+                ' "$path" 2>/dev/null || true
+            )"
+            [[ "$kind" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || kind="launcher"
+            ;;
+    esac
+    printf '%s\n' "$kind"
+}
+
+list_operator_interfaces() {
+    local name kind record path state
+    local -a names=(
+        control-plane
+        dashboard
+        bettercap-tui
+        scapy-tui
+    )
+    local -A seen=()
+
+    for name in "${names[@]}"; do
+        seen["$name"]=1
+    done
+    while IFS= read -r -d '' name; do
+        if [[ -z "${seen[$name]:-}" ]]; then
+            names+=("$name")
+            seen["$name"]=1
+        fi
+    done < <(dynamic_interface_names)
+
+    printf '%-30s %-10s %-10s %s\n' "NAME" "KIND" "STATE" "PATH"
+    printf '%-30s %-10s %-10s %s\n' \
+        "------------------------------" "----------" "----------" "----"
+    for name in "${names[@]}"; do
+        if record="$(resolve_interface "$name" 2>/dev/null)"; then
+            path="${record#*|}"
+            state="available"
+            kind="$(interface_kind "$name" "$path")"
+        else
+            path="-"
+            state="missing"
+            kind="unknown"
+        fi
+        printf '%-30s %-10s %-10s %s\n' "$name" "$kind" "$state" "$path"
+    done
+
+    if [[ -d "$ROOT_DIR/interfaces/desktop" ]]; then
+        while IFS= read -r -d '' path; do
+            printf '%-30s %-10s %-10s %s\n' \
+                "$(basename -- "$path")" "desktop" "resource" "$path"
+        done < <(
+            find -P "$ROOT_DIR/interfaces/desktop" -maxdepth 1 -type f \
+                -name '*.code-workspace' -print0 2>/dev/null | LC_ALL=C sort -z
+        )
+    fi
+}
+
+list_network_interfaces() {
+    local sys_class_net="${OFFENSIVECTL_SYS_CLASS_NET:-/sys/class/net}"
+    local interface_path name state kind address ipv4 default_interface=""
+
+    if command -v ip >/dev/null 2>&1; then
+        default_interface="$(
+            ip -o route show default 2>/dev/null \
+                | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}' \
+                || true
+        )"
+    fi
+
+    printf '%-18s %-10s %-10s %-18s %s\n' \
+        "NAME" "TYPE" "STATE" "MAC" "IPv4"
+    printf '%-18s %-10s %-10s %-18s %s\n' \
+        "------------------" "----------" "----------" "------------------" "----"
+
+    shopt -s nullglob
+    for interface_path in "$sys_class_net"/*; do
+        [[ -d "$interface_path" || -L "$interface_path" ]] || continue
+        name="$(basename -- "$interface_path")"
+        state="unknown"
+        address="-"
+        IFS= read -r state < "$interface_path/operstate" 2>/dev/null || state="unknown"
+        IFS= read -r address < "$interface_path/address" 2>/dev/null || address="-"
+        if [[ "$name" == "lo" ]]; then
+            kind="loopback"
+        elif [[ -d "$interface_path/wireless" ]]; then
+            kind="wireless"
+        elif [[ -d "$interface_path/bridge" ]]; then
+            kind="bridge"
+        else
+            kind="ethernet"
+        fi
+        ipv4="-"
+        if command -v ip >/dev/null 2>&1; then
+            ipv4="$(
+                ip -o -4 address show dev "$name" 2>/dev/null \
+                    | awk '{print $4}' | paste -sd, - \
+                    || true
+            )"
+            ipv4="${ipv4:--}"
+        fi
+        [[ "$name" == "$default_interface" ]] && name="${name}*"
+        printf '%-18s %-10s %-10s %-18s %s\n' \
+            "$name" "$kind" "$state" "$address" "$ipv4"
+    done
+    [[ -n "$default_interface" ]] && printf '\n* default-route interface\n'
+    return 0
+}
+
+cmd_interfaces() {
+    local action="${1:-list}"
+    [[ $# -gt 0 ]] && shift
+
+    case "$action" in
+        list)
+            list_operator_interfaces
+            ;;
+        network|net)
+            list_network_interfaces
+            ;;
+        run)
+            local name="${1:-}"
+            [[ -n "$name" ]] || {
+                echo "Usage: offensivectl interfaces run NAME [args...]" >&2
+                return 2
+            }
+            shift
+            local record runner path python_bin
+            record="$(resolve_interface "$name")" || {
+                echo "Unknown or unavailable interface: $name" >&2
+                return 1
+            }
+            runner="${record%%|*}"
+            path="${record#*|}"
+            printf 'Launching interface: %s\nPath: %s\n' "$name" "$path"
+            case "$runner" in
+                exec) exec "$path" "$@" ;;
+                bash) exec bash "$path" "$@" ;;
+                python)
+                    python_bin="$ROOT_DIR/venv/bin/python3"
+                    [[ -x "$python_bin" ]] || python_bin="$(command -v python3)"
+                    exec "$python_bin" "$path" "$@"
+                    ;;
+            esac
+            ;;
+        help|-h|--help)
+            cat <<'HELP'
+Usage:
+  offensivectl interfaces list
+  offensivectl interfaces network
+  offensivectl interfaces run NAME [args...]
+
+Launchers are discovered from interfaces/launchers and
+OFFENSIVECTL_INTERFACE_PATH.
+The network view is read-only; an asterisk marks the default-route interface.
+HELP
+            printf '\nCurrently discovered:\n'
+            list_operator_interfaces
+            ;;
+        *)
+            echo "Unknown interfaces action: $action" >&2
+            return 2
+            ;;
+    esac
+}
+
+cmd_discover() {
+    local profile_file plugin_manifest
+    cmd_dirs
+    printf '\nModules\n=======\n'
+    printf 'Runnable manifests: %s\n' "$(count_runnable_modules)"
+    printf '\nProfiles\n========\n'
+    while IFS= read -r profile_file; do
+        printf '  %s\n' "$profile_file"
+    done < <(profile_names)
+    printf '\nPlugins\n=======\n'
+    if [[ -d "$ROOT_DIR/plugins/manifests" ]]; then
+        while IFS= read -r -d '' plugin_manifest; do
+            printf '  plugin.%s\n' "$(basename -- "$plugin_manifest" | sed -E 's/\.ya?ml$//')"
+        done < <(
+            find -P "$ROOT_DIR/plugins/manifests" -maxdepth 1 -type f \
+                \( -name '*.yaml' -o -name '*.yml' \) -print0 2>/dev/null | LC_ALL=C sort -z
+        )
+    fi
+    printf '\nOperator Interfaces\n===================\n'
+    list_operator_interfaces
+    printf '\nNetwork Interfaces\n==================\n'
+    list_network_interfaces
+}
+
+require_option_value() {
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "$value" ]] || {
+        echo "$option requires a value" >&2
+        return 2
+    }
+}
+
+config_env_value() {
+    local key="$1"
+    local file="$2"
+
+    [[ -r "$file" ]] || return 1
+    sed -n -E "s/^[[:space:]]*${key}=[[:space:]]*['\"]?([^'\"#[:space:]]+)['\"]?[[:space:]]*(#.*)?$/\\1/p" \
+        "$file" | head -n 1
+}
+
+http_status_code() {
+    local url="$1"
+    local timeout_seconds="$2"
+
+    command -v curl >/dev/null 2>&1 || return 127
+    curl --silent --show-error --output /dev/null \
+        --connect-timeout "$timeout_seconds" \
+        --max-time "$timeout_seconds" \
+        --write-out '%{http_code}' \
+        "$url" 2>/dev/null
+}
+
+cmd_status() {
+    local strict=false
+    local timeout_seconds="${OFFENSIVECTL_STATUS_TIMEOUT:-2}"
+    local api_config="${OMNISCIENT_API_CONFIG:-${HOME:-}/omniscient-operations-console/config/omniscient-api.env}"
+    local api_base_url="${OMNISCIENT_API_BASE_URL:-}"
+    local api_health_path="${OMNISCIENT_API_HEALTH_PATH:-}"
+    local unavailable=0
+    local module_count=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --strict)
+                strict=true
+                shift
+                ;;
+            --timeout)
+                [[ $# -ge 2 ]] || { echo "--timeout requires seconds" >&2; return 2; }
+                timeout_seconds="$2"
+                shift 2
+                ;;
+            -h|--help)
+                cat <<'HELP'
+Usage: offensivectl status [--strict] [--timeout SECONDS]
+
+Reports local workspace and HTTP service availability. By default, unavailable
+optional services are informational. --strict exits non-zero if any are down.
+HELP
+                return 0
+                ;;
+            *)
+                echo "Unknown status option: $1" >&2
+                return 2
+                ;;
+        esac
+    done
+
+    [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || {
+        echo "Invalid timeout: use a positive whole number of seconds" >&2
+        return 2
+    }
+
+    if [[ -z "$api_base_url" ]]; then
+        api_base_url="$(config_env_value OMNISCIENT_API_BASE_URL "$api_config" || true)"
+    fi
+    if [[ -z "$api_health_path" ]]; then
+        api_health_path="$(config_env_value OMNISCIENT_API_HEALTH_PATH "$api_config" || true)"
+    fi
+    api_base_url="${api_base_url:-http://127.0.0.1:8009}"
+    api_health_path="${api_health_path:-/health}"
+
+    module_count="$(count_runnable_modules)"
+
+    echo "offensivectl Status"
+    echo "==================="
+    echo "Version: $OFFENSIVECTL_VERSION"
+    echo "Root:    $ROOT_DIR"
+    printf 'Modules: %s runnable\n\n' "$module_count"
+    printf '%-24s %-10s %s\n' "SERVICE" "STATE" "ENDPOINT"
+    printf '%-24s %-10s %s\n' "------------------------" "----------" "--------"
+
+    local label url code state
+    local -a service_specs=(
+        "Omniscient API|${api_base_url%/}${api_health_path}"
+        "Control plane|http://127.0.0.1:${CONTROL_PLAN_PORT:-8790}/health"
+        "Offensive web|http://127.0.0.1:${OFFENSIVE_WEB_PORT:-8787}${OFFENSIVE_WEB_HEALTH_PATH:-/}"
+        "Ollama|${OLLAMA_BASE_URL:-http://127.0.0.1:11434}/api/tags"
+    )
+    local service_spec
+    for service_spec in "${service_specs[@]}"; do
+        label="${service_spec%%|*}"
+        url="${service_spec#*|}"
+        code="$(http_status_code "$url" "$timeout_seconds" || true)"
+        if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then
+            state="UP ($code)"
+        elif [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then
+            state="ERROR ($code)"
+            unavailable=$((unavailable + 1))
+        else
+            state="DOWN"
+            unavailable=$((unavailable + 1))
+        fi
+        printf '%-24s %-10s %s\n' "$label" "$state" "$url"
+    done
+
+    echo ""
+    if [[ "$unavailable" -eq 0 ]]; then
+        printf '%sAll configured services are reachable.%s\n' "$GREEN" "$NC"
+    else
+        printf '%s%s service(s) unavailable.%s Use --strict for monitoring/automation.\n' \
+            "$YELLOW" "$unavailable" "$NC"
+        if [[ ! -r "$api_config" ]]; then
+            printf 'Omniscient API config not found: %s (using defaults)\n' "$api_config"
+        fi
+    fi
+
+    [[ "$strict" == "false" || "$unavailable" -eq 0 ]]
+}
+
+yaml_value() {
+    local key="$1"
+    local file="$2"
+
+    grep "^${key}:" "$file" 2>/dev/null \
+        | head -n 1 \
+        | cut -d: -f2- \
+        | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' || true
+}
+
+module_manifest_files() {
+    [[ -d "$MODULES_DIR" ]] || return 0
+    find -P "$MODULES_DIR" -mindepth 3 -maxdepth 8 -type f \
+        -name module.yaml -print0 2>/dev/null | LC_ALL=C sort -z
+}
+
+module_candidate_dirs() {
+    [[ -d "$MODULES_DIR" ]] || return 0
+    find -P "$MODULES_DIR" -mindepth 3 -maxdepth 8 -type f \
+        \( -name module.yaml -o -name module.sh \) -printf '%h\0' 2>/dev/null \
+        | LC_ALL=C sort -zu
+}
+
+module_name_from_dir() {
+    local module_dir="$1"
+    local relative="${module_dir#"$MODULES_DIR"/}"
+    printf '%s\n' "${relative//\//.}"
+}
+
+count_runnable_modules() {
+    local module_yaml module_dir
+    local count=0
+
+    while IFS= read -r -d '' module_yaml; do
+        module_dir="${module_yaml%/module.yaml}"
+        [[ -f "$module_dir/module.sh" ]] && count=$((count + 1))
+    done < <(module_manifest_files)
+    printf '%s\n' "$count"
+}
+
+validate_case_id() {
+    local case_id="$1"
+
+    [[ -n "$case_id" ]] || { echo "--case CASE-ID required" >&2; exit 1; }
+    [[ "$case_id" =~ ^CASE-[A-Za-z0-9._-]+$ ]] || {
+        echo "Invalid case ID: must start with CASE- and contain only letters, numbers, dot, dash, or underscore" >&2
+        exit 1
+    }
+    [[ "$case_id" != *..* && "$case_id" != */* && "$case_id" != *\\* ]] || {
+        echo "Invalid case ID: path traversal characters are not allowed" >&2
+        exit 1
+    }
+}
+
+validate_profile_name() {
+    local profile="$1"
+
+    [[ "$profile" =~ ^[A-Za-z0-9._-]+$ ]] || {
+        echo "Invalid profile name: $profile" >&2
+        exit 1
+    }
+    [[ "$profile" != *..* && "$profile" != */* && "$profile" != *\\* ]] || {
+        echo "Invalid profile name: path traversal characters are not allowed" >&2
+        exit 1
+    }
+}
+
+module_dir_for_name() {
+    local module_name="$1"
+    local module_root
+    local module_dir
+    local normalized
+
+    [[ -n "$module_name" ]] || { echo "Module required" >&2; exit 1; }
+    [[ "$module_name" != /* && "$module_name" != *..* && "$module_name" != *\\* ]] || {
+        echo "Invalid module name: $module_name" >&2
+        exit 1
+    }
+    [[ "$module_name" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+        echo "Invalid module name: $module_name" >&2
+        exit 1
+    }
+
+    normalized="${module_name//./\/}"
+    module_root="$(realpath -m "$MODULES_DIR")"
+    module_dir="$(realpath -m "$MODULES_DIR/$normalized")"
+
+    case "$module_dir" in
+        "$module_root"/*)
+            printf '%s\n' "$module_dir"
+            ;;
+        *)
+            echo "Module path escapes modules root: $module_name" >&2
+            exit 1
+            ;;
+    esac
+}
+
+validate_scope_membership() {
+    local target="$1"
+    local scope_file="$2"
+
+    [[ -n "$scope_file" ]] || return 0
+    [[ -f "$scope_file" ]] || { echo "Scope file not found: $scope_file" >&2; exit 1; }
+    grep -Fxq -- "$target" "$scope_file" 2>/dev/null || {
+        echo "Target not in scope file: $target" >&2
+        exit 1
+    }
+}
+
+cmd_list() {
+    echo "Available Modules"
+    echo "================="
+    echo ""
+
+    local module_yaml module_dir relative category module_name
+    local risk mode description current_category=""
+
+    while IFS= read -r -d '' module_yaml; do
+        module_dir="${module_yaml%/module.yaml}"
+        relative="${module_dir#"$MODULES_DIR"/}"
+        category="${relative%%/*}"
+        module_name="$(module_name_from_dir "$module_dir")"
+        if [[ "$category" != "$current_category" ]]; then
+            [[ -n "$current_category" ]] && echo ""
+            echo "## $category"
+            current_category="$category"
+        fi
+
+        risk="$(yaml_value risk_level "$module_yaml")"
+        mode="$(yaml_value mode "$module_yaml")"
+        description="$(yaml_value description "$module_yaml")"
+        if [[ -f "$module_dir/module.sh" ]]; then
+            echo "  - $module_name [$mode, risk: $risk] $description"
+        else
+            echo "  - $module_name [unrunnable: module.sh missing] $description"
+        fi
+    done < <(module_manifest_files)
+
+    [[ -n "$current_category" ]] && echo ""
+
+    return 0
+}
+
+cmd_run() {
+    local module_path=""
+    local case_id=""
+    local target=""
+    local scope_file=""
+    local authorization=""
+    local verbose=false
+    local extra_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --case)
+                require_option_value "$1" "${2:-}" || exit $?
+                case_id="$2"
+                shift 2
+                ;;
+            --target)
+                require_option_value "$1" "${2:-}" || exit $?
+                target="$2"
+                shift 2
+                ;;
+            --scope)
+                require_option_value "$1" "${2:-}" || exit $?
+                scope_file="$2"
+                shift 2
+                ;;
+            --authorization)
+                require_option_value "$1" "${2:-}" || exit $?
+                authorization="$2"
+                shift 2
+                ;;
+            -v|--verbose)
+                verbose=true
+                shift
+                ;;
+            -h|--help)
+                cat <<HELP
+Usage:
+  offensivectl run <module> --case CASE-ID --target TARGET --authorization TOKEN [options]
+
+Module:
+  Module path, using dot syntax:
+    dns.whois_lookup
+    metadata.exiftool
+    web.headers
+    socmint.public_capture
+
+Required:
+  --case CASE-ID
+  --target TARGET
+  --authorization TOKEN
+
+Options:
+  --scope FILE
+  -v, --verbose
+
+Examples:
+  offensivectl run dns.whois_lookup --target example.com --case CASE-001 --authorization token
+  offensivectl run metadata.exiftool --target /path/to/file.jpg --case CASE-001 --authorization token
+  offensivectl run socmint.public_capture --target https://example.com --case CASE-001 --authorization token
+HELP
+                exit 0
+                ;;
+            --*)
+                extra_args+=("$1")
+                if [[ $# -gt 1 && "$2" != --* ]]; then
+                    extra_args+=("$2")
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            *)
+                if [[ -z "$module_path" ]]; then
+                    module_path="$1"
+                else
+                    extra_args+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    [[ -n "$module_path" ]] || { echo "Module required" >&2; exit 1; }
+    validate_case_id "$case_id"
+    [[ -n "$target" ]] || { echo "--target TARGET required" >&2; exit 1; }
+    [[ -n "$authorization" ]] || { echo "--authorization TOKEN required" >&2; exit 1; }
+    validate_scope_membership "$target" "$scope_file"
+
+    local module_dir
+    module_dir="$(module_dir_for_name "$module_path")"
+
+    [[ -d "$module_dir" ]] || {
+        echo "Module not found: $module_path => $module_dir" >&2
+        exit 1
+    }
+
+    [[ -f "$module_dir/module.sh" ]] || {
+        echo "Module script not found: $module_dir/module.sh" >&2
+        exit 1
+    }
+
+    local cmd=(
+        "$module_dir/module.sh"
+        --case "$case_id"
+        --target "$target"
+        --authorization "$authorization"
+    )
+
+    [[ -n "$scope_file" ]] && cmd+=(--scope "$scope_file")
+    [[ "$verbose" == "true" ]] && cmd+=(--verbose)
+
+    if [[ "${#extra_args[@]}" -gt 0 ]]; then
+        cmd+=("${extra_args[@]}")
+    fi
+
+    echo "Running module: $module_path"
+    echo "Root: $ROOT_DIR"
+    bash "${cmd[@]}"
+}
+
+cmd_profile() {
+    local profile=""
+    local target=""
+    local case_id=""
+    local scope_file=""
+    local authorization=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --case)
+                require_option_value "$1" "${2:-}" || exit $?
+                case_id="$2"
+                shift 2
+                ;;
+            --target)
+                require_option_value "$1" "${2:-}" || exit $?
+                target="$2"
+                shift 2
+                ;;
+            --scope)
+                require_option_value "$1" "${2:-}" || exit $?
+                scope_file="$2"
+                shift 2
+                ;;
+            --authorization)
+                require_option_value "$1" "${2:-}" || exit $?
+                authorization="$2"
+                shift 2
+                ;;
+            -h|--help)
+                cat <<HELP
+Usage:
+  offensivectl profile <name> --target TARGET --case CASE-ID --authorization TOKEN [options]
+
+Examples:
+  offensivectl profile passive --target example.com --case CASE-001 --authorization token
+  offensivectl profile standard --target 192.168.1.0/24 --case CASE-001 --scope scope.txt --authorization token
+HELP
+                exit 0
+                ;;
+            *)
+                if [[ -z "$profile" ]]; then
+                    profile="$1"
+                    shift
+                else
+                    echo "Unknown option: $1" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    [[ -n "$profile" ]] || { echo "Profile required" >&2; exit 1; }
+    validate_profile_name "$profile"
+    [[ -n "$target" ]] || { echo "--target TARGET required" >&2; exit 1; }
+    validate_case_id "$case_id"
+    [[ -n "$authorization" ]] || { echo "--authorization TOKEN required" >&2; exit 1; }
+
+    local profile_file="$PROFILES_DIR/${profile}.yaml"
+
+    [[ -f "$profile_file" ]] || {
+        echo "Profile not found: $profile" >&2
+        exit 1
+    }
+
+    local require_scope
+    require_scope="$(yaml_value require_scope_file "$profile_file")"
+    if [[ "$require_scope" == "true" && -z "$scope_file" ]]; then
+        echo "Profile requires --scope FILE: $profile" >&2
+        exit 1
+    fi
+    validate_scope_membership "$target" "$scope_file"
+
+    echo "Running profile: $profile"
+    echo "Target: $target"
+    echo "Case: $case_id"
+    echo "Root: $ROOT_DIR"
+    echo ""
+
+    local -a modules=()
+    mapfile -t modules < <(
+        awk '
+            /^default_modules:[[:space:]]*$/ { in_modules=1; next }
+            in_modules && /^[^[:space:]]/ { exit }
+            in_modules && /^[[:space:]]*-[[:space:]]*/ {
+                sub(/^[[:space:]]*-[[:space:]]*/, "")
+                gsub(/[[:space:]]+$/, "")
+                print
+            }
+        ' "$profile_file"
+    )
+
+    local failed_modules=0
+    local module
+    for module in "${modules[@]}"; do
+        echo "Running module: $module"
+
+        local module_dir
+        module_dir="$(module_dir_for_name "$module")"
+
+        if [[ -f "$module_dir/module.sh" ]]; then
+            local cmd=(
+                "$module_dir/module.sh"
+                --case "$case_id"
+                --target "$target"
+                --authorization "$authorization"
+            )
+
+            [[ -n "$scope_file" ]] && cmd+=(--scope "$scope_file")
+
+            if ! bash "${cmd[@]}"; then
+                echo "Module failed: $module" >&2
+                failed_modules=$((failed_modules + 1))
+            fi
+            echo ""
+        else
+            echo "Module script missing: $module_dir/module.sh" >&2
+            failed_modules=$((failed_modules + 1))
+        fi
+    done
+
+    [[ "$failed_modules" -eq 0 ]]
+}
+
+cmd_report() {
+    local case_id=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --case)
+                require_option_value "$1" "${2:-}" || exit $?
+                case_id="$2"
+                shift 2
+                ;;
+            -h|--help)
+                cat <<HELP
+Usage:
+  offensivectl report --case CASE-ID
+
+Generate a report for a case.
+HELP
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    [[ -n "$case_id" ]] || { echo "--case CASE-ID required" >&2; exit 1; }
+    validate_case_id "$case_id"
+
+    local case_dir="$REPORTS_DIR/$case_id"
+
+    [[ -d "$case_dir" ]] || {
+        echo "Case not found: $case_id" >&2
+        exit 1
+    }
+
+    echo "Generating report for: $case_id"
+    echo "Case directory: $case_dir"
+    echo ""
+
+    local report_helper="$ROOT_DIR/bin/offensive-case-report"
+    if [[ -x "$report_helper" ]]; then
+        python3 "$report_helper" --root "$ROOT_DIR" --case "$case_id"
+    else
+        echo "Modules executed:"
+        shopt -s nullglob
+        for module_dir in "$case_dir"/*; do
+            if [[ -d "$module_dir" ]]; then
+                local mod_name
+                mod_name="$(basename "$module_dir")"
+                echo "  - $mod_name"
+            fi
+        done
+    fi
+}
+
+cmd_doctor() {
+    local failures=0
+
+    echo "offensivectl Doctor"
+    echo "==================="
+    echo ""
+    echo "Root: $ROOT_DIR"
+    if [[ -d "$OFFENSIVE_BIN" && ":$PATH:" == *":$OFFENSIVE_BIN:"* ]]; then
+        echo -e "${GREEN}[OK]${NC} offensive bin on PATH: $OFFENSIVE_BIN"
+    else
+        echo -e "${YELLOW}[WARN]${NC} offensive bin unavailable: $OFFENSIVE_BIN"
+    fi
+    if [[ -n "$USER_LOCAL_BIN" && -d "$USER_LOCAL_BIN" && ":$PATH:" == *":$USER_LOCAL_BIN:"* ]]; then
+        echo -e "${GREEN}[OK]${NC} local bin on PATH: $USER_LOCAL_BIN"
+    elif [[ -n "$USER_LOCAL_BIN" ]]; then
+        echo -e "${YELLOW}[WARN]${NC} local bin unavailable: $USER_LOCAL_BIN"
+    else
+        echo -e "${YELLOW}[WARN]${NC} HOME unavailable; local bin not configured"
+    fi
+    echo ""
+
+    for dir in "$ROOT_DIR" "$MODULES_DIR" "$PROFILES_DIR" "$REPORTS_DIR" "$LOGS_DIR" "$REGISTRY_DIR"; do
+        if [[ -d "$dir" ]]; then
+            echo -e "${GREEN}[OK]${NC} directory: $dir"
+        else
+            echo -e "${RED}[FAIL]${NC} missing directory: $dir"
+            failures=$((failures + 1))
+        fi
+    done
+
+    echo ""
+
+    if [[ -L /usr/local/bin/offensivectl ]]; then
+        local link_target
+        link_target="$(readlink -f /usr/local/bin/offensivectl || true)"
+        echo -e "${GREEN}[OK]${NC} /usr/local/bin/offensivectl -> $link_target"
+
+        if [[ "$link_target" != "$ROOT_DIR/offensivectl" && "$link_target" != "$ROOT_DIR/bin/offensivectl" ]]; then
+            echo -e "${YELLOW}[WARN]${NC} symlink target does not match an offensivectl entrypoint"
+        fi
+    elif [[ -x /usr/local/bin/offensivectl ]] \
+        && grep -q 'OMNISCIENTCTL_LOG_WRAPPER' /usr/local/bin/offensivectl 2>/dev/null; then
+        echo -e "${GREEN}[OK]${NC} /usr/local/bin/offensivectl is an audit logging wrapper"
+    else
+        if [[ -f /usr/local/bin/offensivectl ]]; then
+            echo -e "${YELLOW}[WARN]${NC} /usr/local/bin/offensivectl is an unrecognized regular file"
+        else
+            echo -e "${RED}[FAIL]${NC} /usr/local/bin/offensivectl missing"
+            failures=$((failures + 1))
+        fi
+    fi
+
+    if [[ -x /usr/local/libexec/offensivectl.real ]]; then
+        if cmp -s "$ROOT_DIR/offensivectl" /usr/local/libexec/offensivectl.real; then
+            echo -e "${GREEN}[OK]${NC} installed controller matches workspace"
+        else
+            echo -e "${YELLOW}[WARN]${NC} installed controller is stale; deploy $ROOT_DIR/offensivectl"
+        fi
+    fi
+
+    echo ""
+
+    local module_count=0 module_dir module_name
+    while IFS= read -r -d '' module_dir; do
+        module_count=$((module_count + 1))
+        module_name="$(module_name_from_dir "$module_dir")"
+
+        if [[ -f "$module_dir/module.yaml" ]]; then
+            echo -e "${GREEN}[OK]${NC} $module_name module.yaml"
+        else
+            echo -e "${RED}[FAIL]${NC} $module_name missing module.yaml"
+            failures=$((failures + 1))
+        fi
+
+        if [[ -f "$module_dir/module.sh" ]]; then
+            echo -e "${GREEN}[OK]${NC} $module_name module.sh"
+        else
+            echo -e "${RED}[FAIL]${NC} $module_name missing module.sh"
+            failures=$((failures + 1))
+        fi
+
+        [[ -x "$module_dir/module.sh" ]] \
+            && echo -e "${GREEN}[OK]${NC} $module_name executable" \
+            || echo -e "${YELLOW}[WARN]${NC} $module_name module.sh not executable"
+    done < <(module_candidate_dirs)
+
+    echo ""
+
+    if [[ "$module_count" -eq 0 ]]; then
+        echo -e "${YELLOW}[WARN]${NC} no modules found"
+    else
+        echo -e "${GREEN}[OK]${NC} modules found: $module_count"
+    fi
+    echo ""
+    echo "Failures: $failures"
+
+    [[ "$failures" -eq 0 ]]
+}
+
+resolve_kali_ones_bin() {
+    local candidate
+    if [[ -n "${OFFENSIVECTL_KALI_ONES_BIN:-}" ]]; then
+        printf '%s\n' "$OFFENSIVECTL_KALI_ONES_BIN"
+        return
+    fi
+
+    for candidate in \
+        "$ROOT_DIR/labs/exercises/kali-ones-learning/bin/kali-ones-offensive" \
+        "$ROOT_DIR/kali-ones-learning/bin/kali-ones-offensive" \
+        "/opt/omniscient/offensive/kali-ones-learning/bin/kali-ones-offensive"; do
+        [[ -x "$candidate" ]] && { printf '%s\n' "$candidate"; return; }
+    done
+
+    find -P "$ROOT_DIR" -mindepth 2 -maxdepth 8 -type f \
+        -name kali-ones-offensive -perm -u+x -print -quit 2>/dev/null
+}
+
+show_kali_ones_help() {
+    cat <<'EOF'
+Usage: offensivectl kali <command> [args...]
+
+Commands:
+  help|--help|-h   Show this help
+  list             Show Kali One binary help / available one-liners
+  run <cmd> [...]  Run a Kali one-liner via kali-ones-offensive
+  <cmd> [...]      Forward directly to kali-ones-offensive
+
+Examples:
+  offensivectl kali help
+  offensivectl kali list
+  offensivectl kali run scan --target 10.0.0.1
+  offensivectl kali finder example.com
+EOF
+}
+
+list_kali_one_liners() {
+    local kali_bin="$1"
+    if [[ -x "$kali_bin" ]]; then
+        bash "$kali_bin" --help 2>/dev/null || bash "$kali_bin" help 2>/dev/null
+    else
+        echo "kali-ones-offensive binary not executable: $kali_bin" >&2
+        return 1
+    fi
+}
+
+cmd_kali_ones() {
+    local action="${1:-help}"
+    shift || true
+
+    local kali_bin
+    kali_bin="$(resolve_kali_ones_bin)"
+    [[ -x "$kali_bin" ]] || {
+        echo "kali-ones-offensive not found under $ROOT_DIR or configured external paths" >&2
+        exit 1
+    }
+
+    case "$action" in
+        help|-h|--help)
+            show_kali_ones_help
+            ;;
+        list)
+            list_kali_one_liners "$kali_bin"
+            ;;
+        run)
+            if [[ $# -lt 1 ]]; then
+                echo "Usage: offensivectl kali run <command> [args...]" >&2
+                exit 2
+            fi
+            bash "$kali_bin" "$@"
+            ;;
+        *)
+            bash "$kali_bin" "$action" "$@"
+            ;;
+    esac
+}
+
+resolve_lms_helper() {
+    local candidate
+    if [[ -n "${OFFENSIVECTL_LMS_SCRIPT:-}" ]]; then
+        [[ -x "$OFFENSIVECTL_LMS_SCRIPT" ]] || return 1
+        printf '%s\n' "$OFFENSIVECTL_LMS_SCRIPT"
+        return 0
+    fi
+    for candidate in \
+        "$ROOT_DIR/scripts/lms-start-server-load-modules.sh" \
+        "$ROOT_DIR/integrations/lms/lms-start-server-load-modules.sh" \
+        "/opt/omniscient/scripts/lms-start-server-load-modules.sh"; do
+        [[ -x "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+    done
+    find -P "$ROOT_DIR" -mindepth 2 -maxdepth 7 -type f \
+        -name lms-start-server-load-modules.sh -perm -u+x \
+        -print -quit 2>/dev/null
+}
+
+cmd_lms() {
+    local action="${1:-status}"
+    local base_url="${LMS_BASE_URL:-http://127.0.0.1:1234}"
+    local lms_script=""
+    [[ $# -gt 0 ]] && shift
+
+    case "$action" in
+        status|start|load|pull|reload)
+            lms_script="$(resolve_lms_helper)"
+            [[ -x "$lms_script" ]] || {
+                echo "[ERROR] LMS helper not found under configured workspace paths" >&2
+                return 1
+            }
+            case "$action" in
+                status) "$lms_script" --status "$@" ;;
+                start) "$lms_script" --server-only "$@" ;;
+                load) LMS_GPU="${LMS_GPU:-}" "$lms_script" --load --no-server "$@" ;;
+                pull) "$lms_script" --pull --no-server "$@" ;;
+                reload) LMS_GPU="${LMS_GPU:-}" "$lms_script" --pull --load "$@" ;;
+            esac
+            ;;
+        models)
+            curl --silent --show-error "${base_url%/}/v1/models"
+            echo
+            ;;
+        test)
+            curl --silent --show-error "${base_url%/}/v1/chat/completions" \
+                -H "Content-Type: application/json" --data-binary @- <<'EOF'
+{
+  "model": "mistralai/mistral-7b-instruct-v0.3",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Say Omniscient LMS is online in one sentence."
+    }
+  ],
+  "temperature": 0.2,
+  "max_tokens": 80
+}
+EOF
+            echo
+            ;;
+        help|-h|--help)
+            cat <<'HELP'
+Usage:
+  offensivectl lms status|start|load|pull|reload
+  offensivectl lms models|test
+
+Overrides: OFFENSIVECTL_LMS_SCRIPT, LMS_BASE_URL, LMS_GPU
+HELP
+            ;;
+        *)
+            echo "Unknown LMS action: $action" >&2
+            return 2
+            ;;
+    esac
+}
+
+cmd_vuln() {
+    local area="${1:-help}"
+    [[ $# -gt 0 ]] && shift
+
+    case "$area" in
+        case)
+            local case_action="${1:-help}"
+            [[ $# -gt 0 ]] && shift
+            case "$case_action" in
+                init|new|open)
+                    cmd_run vulnerability.research --target case-init "$@"
+                    ;;
+                status|show)
+                    cmd_run vulnerability.research --target status "$@"
+                    ;;
+                *)
+                    echo "Usage: offensivectl vuln case init|status --case CASE-ID --authorization ID" >&2
+                    return 2
+                    ;;
+            esac
+            ;;
+        target)
+            local target_action="${1:-help}"
+            [[ $# -gt 0 ]] && shift
+            case "$target_action" in
+                add|import)
+                    local input_file="${1:-}"
+                    [[ -n "$input_file" && "$input_file" != --* ]] || {
+                        echo "Usage: offensivectl vuln target add FILE --case CASE-ID --authorization ID" >&2
+                        return 2
+                    }
+                    shift
+                    cmd_run vulnerability.research --target target-add --input "$input_file" "$@"
+                    ;;
+                *)
+                    echo "Usage: offensivectl vuln target add FILE --case CASE-ID --authorization ID" >&2
+                    return 2
+                    ;;
+            esac
+            ;;
+        inspect|protections)
+            cmd_run vulnerability.research --target inspect "$@"
+            ;;
+        crash)
+            local crash_action="${1:-help}"
+            [[ $# -gt 0 ]] && shift
+            case "$crash_action" in
+                import)
+                    local crash_file="${1:-}"
+                    [[ -n "$crash_file" && "$crash_file" != --* ]] || {
+                        echo "Usage: offensivectl vuln crash import FILE --case CASE-ID --authorization ID" >&2
+                        return 2
+                    }
+                    shift
+                    cmd_run vulnerability.research --target crash-import --input "$crash_file" "$@"
+                    ;;
+                analyze)
+                    cmd_run vulnerability.research --target crash-analyze "$@"
+                    ;;
+                *)
+                    echo "Usage: offensivectl vuln crash import FILE|analyze --case CASE-ID --authorization ID" >&2
+                    return 2
+                    ;;
+            esac
+            ;;
+        exploitability)
+            [[ "${1:-}" == "assess" ]] || {
+                echo "Usage: offensivectl vuln exploitability assess --case CASE-ID --authorization ID" >&2
+                return 2
+            }
+            shift
+            cmd_run vulnerability.research --target assess "$@"
+            ;;
+        assess)
+            cmd_run vulnerability.research --target assess "$@"
+            ;;
+        report)
+            cmd_run vulnerability.research --target report "$@"
+            ;;
+        status)
+            cmd_run vulnerability.research --target status "$@"
+            ;;
+        help|-h|--help)
+            cat <<'HELP'
+Usage:
+  offensivectl vuln case init --case CASE-ID --authorization ID [--title TEXT]
+  offensivectl vuln case status --case CASE-ID --authorization ID
+  offensivectl vuln target add FILE --case CASE-ID --authorization ID [--label TEXT]
+  offensivectl vuln inspect --case CASE-ID --authorization ID [--target-id ID]
+  offensivectl vuln crash import FILE --case CASE-ID --authorization ID [--label TEXT]
+  offensivectl vuln crash analyze --case CASE-ID --authorization ID [--crash-id ID]
+  offensivectl vuln exploitability assess --case CASE-ID --authorization ID
+  offensivectl vuln report --case CASE-ID --authorization ID
+
+Vulnerability Research v0.1 performs local evidence intake, bounded static
+inspection, crash-text triage, conservative assessment, and reporting. It does
+not execute imported targets, fuzz processes, generate exploits or payloads, or
+access network targets.
+HELP
+            ;;
+        *)
+            echo "Unknown vuln command: $area" >&2
+            echo "Use: offensivectl vuln --help" >&2
+            return 2
+            ;;
+    esac
+}
+
+cmd_registry() {
+    local action="${1:-help}"
+    shift || true
+
+    case "$action" in
+        rebuild)
+            mkdir -p "$REGISTRY_DIR"
+
+            local registry_file="$REGISTRY_DIR/modules.tsv"
+
+            printf 'module_name\tcategory\tmodule\tpath\tmode\trisk_level\tdescription\n' > "$registry_file"
+
+            local module_yaml module_dir
+            while IFS= read -r -d '' module_yaml; do
+                module_dir="${module_yaml%/module.yaml}"
+                local relative
+                local category
+                local module
+                local module_name
+                local mode
+                local risk
+                local description
+
+                relative="${module_dir#"$MODULES_DIR"/}"
+                category="${relative%%/*}"
+                module="${relative#*/}"
+                module_name="$(module_name_from_dir "$module_dir")"
+                mode="$(yaml_value mode "$module_yaml")"
+                risk="$(yaml_value risk_level "$module_yaml")"
+                description="$(yaml_value description "$module_yaml")"
+
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$module_name" \
+                    "$category" \
+                    "$module" \
+                    "$module_dir" \
+                    "$mode" \
+                    "$risk" \
+                    "$description" >> "$registry_file"
+            done < <(module_manifest_files)
+
+            echo "Registry rebuilt:"
+            echo "$registry_file"
+            ;;
+        show)
+            local registry_file="$REGISTRY_DIR/modules.tsv"
+
+            [[ -f "$registry_file" ]] || {
+                echo "Registry missing. Run: offensivectl registry rebuild" >&2
+                exit 1
+            }
+
+            if command -v column >/dev/null 2>&1; then
+                column -t -s $'\t' "$registry_file"
+            else
+                cat "$registry_file"
+            fi
+            ;;
+        help|--help|-h)
+            cat <<HELP
+Usage:
+  offensivectl registry rebuild
+  offensivectl registry show
+HELP
+            ;;
+        *)
+            echo "Unknown registry action: $action" >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_results() {
+    local action="${1:-list}"
+    local results_dir="$ROOT_DIR/results"
+
+    case "$action" in
+        list)
+            if [[ ! -d "$results_dir" ]]; then
+                echo "No saved quick results found." >&2
+                return 0
+            fi
+            printf '%-4s  %-20s  %-8s  %s\n' "#" "UPDATED" "SIZE" "FILE"
+            printf '%-4s  %-20s  %-8s  %s\n' "----" "-------------------" "--------" "----"
+            local idx=0 file
+            while IFS= read -r -d '' file; do
+                idx=$((idx + 1))
+                printf '%-4s  %-20s  %-8s  %s\n' \
+                    "$idx" \
+                    "$(date -r "$file" '+%Y-%m-%d %H:%M:%S')" \
+                    "$(stat -c '%s' "$file")" \
+                    "${file#$ROOT_DIR/}"
+            done < <(find "$results_dir" -maxdepth 1 -type f | LC_ALL=C sort)
+            ;;
+        delete)
+            if [[ -z "${2:-}" ]]; then
+                echo "Usage: offensivectl results delete <file>" >&2
+                return 2
+            fi
+            local target="$2"
+            local path="$results_dir/$target"
+            if [[ ! -f "$path" ]]; then
+                echo "Result file not found: $target" >&2
+                return 1
+            fi
+            rm -f -- "$path"
+            echo "Deleted $target"
+            ;;
+        clean)
+            local older_than=30
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --older-days)
+                        require_option_value "$1" "${2:-}" || return 2
+                        older_than="$2"
+                        shift 2
+                        ;;
+                    --all)
+                        older_than=0
+                        shift
+                        ;;
+                    -h|--help)
+                        echo "Usage: offensivectl results clean [--older-days N] [--all]"
+                        return 0
+                        ;;
+                    *)
+                        echo "Unknown results clean option: $1" >&2
+                        return 2
+                        ;;
+                esac
+            done
+            if [[ ! -d "$results_dir" ]]; then
+                echo "No saved quick results to clean." >&2
+                return 0
+            fi
+            if [[ "$older_than" -eq 0 ]]; then
+                find "$results_dir" -maxdepth 1 -type f -print0 | xargs -0 rm -f --
+                echo "Removed all saved quick results."
+                return 0
+            fi
+            local removed=0 file
+            while IFS= read -r -d '' file; do
+                rm -f -- "$file"
+                removed=$((removed + 1))
+            done < <(find "$results_dir" -maxdepth 1 -type f -mtime +$older_than -print0)
+            echo "Removed $removed result file(s) older than $older_than days."
+            ;;
+        help|-h|--help)
+            cat <<HELP
+Usage: offensivectl results <action> [options]
+
+Actions:
+  list                     List saved quick result files
+  delete <file>            Delete a saved result file
+  clean [--older-days N]   Remove result files older than N days
+  clean --all              Remove all saved result files
+HELP
+            ;;
+        *)
+            echo "Unknown results action: $action" >&2
+            echo "Run: offensivectl results help" >&2
+            return 1
+            ;;
+    esac
+}
+
+# ──────────────────────────────────────────────
+# AI sub-command: delegate to offensive-ai
+# ──────────────────────────────────────────────
+cmd_ai() {
+    local ai_bin="$OFFENSIVE_BIN/offensive-ai"
+    if [[ ! -x "$ai_bin" ]]; then
+        echo -e "${RED}[ERROR]${NC} offensive-ai not found at $ai_bin" >&2
+        exit 1
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        echo -e "${YELLOW}Usage:${NC} offensivectl ai <command> [options]"
+        echo ""
+        echo "Commands:"
+        echo "  status              Check Ollama connectivity"
+        echo "  models              List available Ollama models"
+        echo "  summarise MSG       Summarise tool/module output"
+        echo "  explain MSG         Explain a Kali tool/command"
+        echo "  analyse MSG         Analyse output for insights"
+        echo "  chat MSG            General conversation"
+        echo "  shell MSG           Get safe shell commands"
+        echo "  report MSG          Draft a report"
+        echo ""
+        echo "Options:"
+        echo "  --model NAME        Specify Ollama model"
+        echo "  --temp VALUE        Temperature (0.0-1.0)"
+        exit 0
+    fi
+
+    exec bash "$ai_bin" "$@"
+}
+
+# ──────────────────────────────────────────────
+# Quick one-liner workflows
+# ──────────────────────────────────────────────
+cmd_quick() {
+    # Handle --help before anything
+    for arg in "$@"; do
+        if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+            cat <<HELP
+Usage: offensivectl quick <workflow> [options] [target]
+
+Workflows:
+  dns-recon <domain>       DNS recon: dig + whois + subfinder
+  port-scan <target>       Quick port scan with nmap
+  vuln-scan <target>       Vulnerability scan using nmap NSE vuln scripts
+  web-tech <url>           Identify web technologies
+  subdomains <domain>      Passive subdomain discovery
+  kali-scan <target>       Quick nmap-based Kali-style scan
+  kali-dns <domain>         DNS + whois + passive subdomain discovery
+  kali-webtech <url>        Web-tech fingerprinting with curl/whatweb
+
+Options:
+  --ai            Pipe output through Ollama AI summarisation
+  --model NAME    Ollama model for AI summarisation
+  --target T      Explicitly specify target
+  --save          Save output to a default quick-results file
+  --save-file F   Write output to the specified file
+  -h, --help      Show this help
+
+Examples:
+  offensivectl quick dns-recon example.com
+  offensivectl quick port-scan 192.168.1.1
+  offensivectl quick web-tech https://example.com --ai
+  offensivectl quick subdomains example.com --model gemma4:12b
+HELP
+            exit 0
+        fi
+    done
+
+    local workflow="${1:-}"
+    shift || true
+
+    local target=""
+    local use_ai=false
+    local ai_args=()
+    local save_output=false
+    local save_file=""
+
+    # Parse common options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ai) use_ai=true; shift ;;
+            --model)
+                require_option_value "$1" "${2:-}" || exit $?
+                ai_args+=(--model "$2")
+                shift 2
+                ;;
+            --target)
+                require_option_value "$1" "${2:-}" || exit $?
+                target="$2"
+                shift 2
+                ;;
+            --save)
+                save_output=true
+                shift
+                ;;
+            --save-file)
+                require_option_value "$1" "${2:-}" || exit $?
+                save_file="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$target" ]]; then
+                    target="$1"
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -n "$target" ]] || {
+        echo -e "${RED}[ERROR]${NC} Target is required" >&2
+        echo "Usage: offensivectl quick <workflow> [options] [target]" >&2
+        echo "Try: offensivectl quick --help" >&2
+        exit 1
+    }
+
+    local tmpfile
+    tmpfile="$(mktemp)"
+    trap 'rm -f "$tmpfile"' RETURN
+
+    case "$workflow" in
+        dns-recon)
+            echo -e "${BLUE}[*]${NC} DNS Recon on: $target"
+            echo "============================================" > "$tmpfile"
+
+            if command -v dig &>/dev/null; then
+                echo -e "${GREEN}[+]${NC} Running dig..."
+                {
+                    echo "=== DIG A Record ==="
+                    dig +short A "$target" 2>&1
+                    echo ""
+                    echo "=== DIG MX Records ==="
+                    dig +short MX "$target" 2>&1
+                    echo ""
+                    echo "=== DIG NS Records ==="
+                    dig +short NS "$target" 2>&1
+                    echo ""
+                    echo "=== DIG TXT Records ==="
+                    dig +short TXT "$target" 2>&1
+                } >> "$tmpfile"
+            else
+                echo -e "${YELLOW}[!]${NC} dig not installed, skipping" >> "$tmpfile"
+            fi
+
+            if command -v whois &>/dev/null; then
+                echo -e "${GREEN}[+]${NC} Running whois..."
+                {
+                    echo ""
+                    echo "=== WHOIS ==="
+                    timeout 10 whois "$target" 2>&1 | head -50
+                } >> "$tmpfile"
+            else
+                echo -e "${YELLOW}[!]${NC} whois not installed, skipping"
+            fi
+
+            if command -v subfinder &>/dev/null; then
+                echo -e "${GREEN}[+]${NC} Running subfinder..."
+                {
+                    echo ""
+                    echo "=== SUBFINDER ==="
+                    subfinder -d "$target" -silent 2>&1 || true
+                } >> "$tmpfile"
+            else
+                echo -e "${YELLOW}[!]${NC} subfinder not installed, skipping"
+            fi
+            ;;
+
+        port-scan)
+            echo -e "${BLUE}[*]${NC} Port scan on: $target"
+            echo "============================================" > "$tmpfile"
+            echo "=== NMAP Quick Scan ===" >> "$tmpfile"
+
+            if command -v nmap &>/dev/null; then
+                echo -e "${GREEN}[+]${NC} Running nmap (top 1000 ports)..."
+                nmap -T4 --top-ports 1000 --open "$target" 2>&1 | tail -30 >> "$tmpfile"
+            else
+                echo -e "${YELLOW}[!]${NC} nmap not installed" >> "$tmpfile"
+            fi
+            ;;
+
+        vuln-scan)
+            echo -e "${BLUE}[*]${NC} Vulnerability scan on: $target"
+            echo "============================================" > "$tmpfile"
+            echo "=== NMAP Vulnerability Scan ===" >> "$tmpfile"
+
+            if command -v nmap &>/dev/null; then
+                echo -e "${GREEN}[+]${NC} Running nmap with NSE vuln scripts..."
+                nmap -T4 --script vuln --script-args vulns.showall=1 "$target" 2>&1 >> "$tmpfile"
+            else
+                echo -e "${YELLOW}[!]${NC} nmap not installed" >> "$tmpfile"
+            fi
+            ;;
+
+        web-tech)
+            echo -e "${BLUE}[*]${NC} Web tech detection on: $target"
+            echo "============================================" > "$tmpfile"
+
+            if command -v whatweb &>/dev/null; then
+                echo -e "${GREEN}[+]${NC} Running whatweb..."
+                echo "=== WHATWEB ===" >> "$tmpfile"
+                whatweb "$target" --aggression 1 >> "$tmpfile" 2>&1 || true
+            fi
+
+            {
+                echo ""
+                echo "=== CURL Headers ==="
+            } >> "$tmpfile"
+            curl -sI -L --max-time 10 "$target" >> "$tmpfile" 2>&1 || echo "curl failed" >> "$tmpfile"
+
+            echo "" >> "$tmpfile"
+            echo "=== CURL Body (first 20 lines) ===" >> "$tmpfile"
+            curl -sL --max-time 10 "$target" 2>&1 | head -20 >> "$tmpfile"
+            ;;
+
+        subdomains)
+            echo -e "${BLUE}[*]${NC} Subdomain discovery on: $target"
+            echo "============================================" > "$tmpfile"
+
+            if command -v subfinder &>/dev/null; then
+                echo -e "${GREEN}[+]${NC} Running subfinder..."
+                echo "=== SUBFINDER ===" >> "$tmpfile"
+                subfinder -d "$target" -silent >> "$tmpfile" 2>&1 || true
+            fi
+
+            echo "" >> "$tmpfile"
+            if command -v amass &>/dev/null; then
+                echo -e "${GREEN}[+]${NC} Running amass (passive)..."
+                echo "=== AMASS ===" >> "$tmpfile"
+                amass enum -passive -d "$target" 2>&1 | head -100 >> "$tmpfile" || true
+            else
+                echo -e "${YELLOW}[!]${NC} amass not installed, skipping"
+            fi
+            ;;
+
+        kali-scan)
+            echo -e "${BLUE}[*]${NC} Kali quick scan on: $target"
+            echo "============================================" > "$tmpfile"
+            if command -v nmap &>/dev/null; then
+                echo -e "${GREEN}[+]${NC} Running nmap..."
+                nmap -T4 --top-ports 1000 --open "$target" 2>&1 >> "$tmpfile"
+            else
+                echo -e "${YELLOW}[!]${NC} nmap not installed" >> "$tmpfile"
+            fi
+            ;;
+
+        kali-dns)
+            echo -e "${BLUE}[*]${NC} Kali DNS recon on: $target"
+            echo "============================================" > "$tmpfile"
+            if command -v dig &>/dev/null; then
+                echo "=== DIG A Records ===" >> "$tmpfile"
+                dig +short A "$target" 2>&1 >> "$tmpfile"
+            fi
+            if command -v whois &>/dev/null; then
+                echo "" >> "$tmpfile"
+                echo "=== WHOIS ===" >> "$tmpfile"
+                timeout 10 whois "$target" 2>&1 | head -50 >> "$tmpfile"
+            fi
+            if command -v subfinder &>/dev/null; then
+                echo "" >> "$tmpfile"
+                echo "=== SUBFINDER ===" >> "$tmpfile"
+                subfinder -d "$target" -silent >> "$tmpfile" 2>&1 || true
+            fi
+            ;;
+
+        kali-webtech)
+            echo -e "${BLUE}[*]${NC} Web tech detection on: $target"
+            echo "============================================" > "$tmpfile"
+            if command -v whatweb &>/dev/null; then
+                echo "=== WHATWEB ===" >> "$tmpfile"
+                whatweb "$target" --aggression 1 >> "$tmpfile" 2>&1 || true
+            fi
+            echo "" >> "$tmpfile"
+            echo "=== CURL HEADERS ===" >> "$tmpfile"
+            curl -sI -L --max-time 10 "$target" >> "$tmpfile" 2>&1 || echo "curl failed" >> "$tmpfile"
+            ;;
+
+        *)
+            echo -e "${RED}[ERROR]${NC} Unknown workflow: $workflow" >&2
+            echo "Use: offensivectl quick --help for available workflows"
+            exit 1
+            ;;
+    esac
+
+    echo ""
+    echo -e "${GREEN}[SUCCESS]${NC} Results:"
+    echo ""
+    cat "$tmpfile"
+
+    if [[ "$save_output" == true || -n "$save_file" ]]; then
+        local outdir="$ROOT_DIR/results"
+        mkdir -p "$outdir"
+        local timestamp
+        timestamp="$(date -u +'%Y%m%dT%H%M%SZ')"
+        local default_file="$outdir/quick-${workflow// /_}-${target//[^a-zA-Z0-9_-]/_}-${timestamp}.txt"
+        local dest="${save_file:-$default_file}"
+
+        if [[ -z "$save_file" ]]; then
+            echo -e "${BLUE}[*]${NC} Saving output to ${dest}"
+        else
+            echo -e "${BLUE}[*]${NC} Saving output to custom file ${dest}"
+        fi
+
+        if ! cp "$tmpfile" "$dest" 2>/dev/null; then
+            echo -e "${RED}[ERROR]${NC} Failed to save output to ${dest}" >&2
+        fi
+    fi
+
+    if [[ "$use_ai" == true ]]; then
+        echo ""
+        echo -e "${BLUE}[*]${NC} Sending output to Ollama for analysis..."
+        local ai_bin="$OFFENSIVE_BIN/offensive-ai"
+        if [[ -x "$ai_bin" ]]; then
+            bash "$ai_bin" summarise "${ai_args[@]}" "$(cat "$tmpfile")" || true
+        else
+            echo -e "${YELLOW}[!]${NC} offensive-ai not found, skipping AI analysis"
+        fi
+    fi
+}
+
+main() {
+    local command="${1:-help}"
+    shift || true
+
+    case "$command" in
+        list)
+            cmd_list "$@"
+            ;;
+        run)
+            cmd_run "$@"
+            ;;
+        profile)
+            cmd_profile "$@"
+            ;;
+        report)
+            cmd_report "$@"
+            ;;
+        status)
+            cmd_status "$@"
+            ;;
+        services)
+            if [[ "${1:-status}" != "status" ]]; then
+                echo "Unknown services action: ${1:-}" >&2
+                echo "Usage: offensivectl services status [--strict] [--timeout SECONDS]" >&2
+                exit 1
+            fi
+            [[ $# -gt 0 ]] && shift
+            cmd_status "$@"
+            ;;
+        dirs|directories)
+            cmd_dirs "$@"
+            ;;
+        interface|interfaces)
+            cmd_interfaces "$@"
+            ;;
+        launcher|launchers|apps)
+            cmd_interfaces list "$@"
+            ;;
+        load|launch)
+            cmd_interfaces run "$@"
+            ;;
+        discover)
+            cmd_discover "$@"
+            ;;
+        doctor)
+            cmd_doctor "$@"
+            ;;
+        registry)
+            cmd_registry "$@"
+            ;;
+        results)
+            cmd_results "$@"
+            ;;
+        ai)
+            cmd_ai "$@"
+            ;;
+        quick)
+            cmd_quick "$@"
+            ;;
+        lms)
+            cmd_lms "$@"
+            ;;
+        kali-ones|kaliones|kali)
+            cmd_kali_ones "$@"
+            ;;
+        vuln|vulnerability|vulnerability-research)
+            cmd_vuln "$@"
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            if resolve_interface "$command" >/dev/null 2>&1; then
+                cmd_interfaces run "$command" "$@"
+            else
+                echo "Unknown command or launcher: $command" >&2
+                usage
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+main "$@"
+
