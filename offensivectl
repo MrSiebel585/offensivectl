@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
+# Route workflows, dfir, and osint to the fixed workflow registry helper.
+# This early hook runs before root/PATH setup and ignores root overrides.
 # OFFENSIVECTL_WORKFLOW_REGISTRY_HOOK_V1
 if [[ "${1:-}" == "workflows" || "${1:-}" == "dfir" || "${1:-}" == "osint" ]]; then
     exec /usr/bin/env python3 "/opt/offensive/workflow_registry.py" "$@"
 fi
+# Route ai guide/summarize to the dedicated helper; summarise uses cmd_ai.
 # OFFENSIVECTL_OLLAMA_DFIR_OSINT_HOOK_V1
 if [[ "${1:-}" == "ai" && ( "${2:-}" == "guide" || "${2:-}" == "summarize" ) ]]; then
     action="$2"
@@ -18,8 +21,10 @@ fi
 # Symlink:
 #   /usr/local/bin/offensivectl -> /opt/offensive/offensivectl
 
+# Preserve strict failure handling and pipeline status propagation.
 set -euo pipefail
 
+# Resolve installation symlinks before deriving workspace paths.
 SOURCE_PATH="${BASH_SOURCE[0]}"
 while [[ -L "$SOURCE_PATH" ]]; do
     SOURCE_DIR="$(cd -P -- "$(dirname -- "$SOURCE_PATH")" && pwd)"
@@ -29,6 +34,7 @@ done
 
 SCRIPT_DIR="$(cd -P -- "$(dirname -- "$SOURCE_PATH")" && pwd)"
 readonly SCRIPT_DIR
+# OFFENSIVECTL_ROOT overrides the workspace; other directories derive from it.
 readonly ROOT_DIR="${OFFENSIVECTL_ROOT:-$SCRIPT_DIR}"
 readonly MODULES_DIR="$ROOT_DIR/modules"
 readonly PROFILES_DIR="$ROOT_DIR/profiles"
@@ -68,6 +74,15 @@ if [[ -n "$USER_LOCAL_BIN" && -d "$USER_LOCAL_BIN" && ":$PATH:" != *":$USER_LOCA
     export PATH="$USER_LOCAL_BIN:$PATH"
 fi
 
+# Print short execution labels to stderr, keeping stdout available for results.
+# Set OFFENSIVECTL_LABELS=0 to suppress these additional labels.
+execution_label() {
+    [[ "${OFFENSIVECTL_LABELS:-1}" != "0" ]] || return 0
+    printf '[offensivectl] %s\n' "$*" >&2
+}
+
+# builtin_command_catalog: Read built-in command labels.
+# Print command|description records for generated help.
 builtin_command_catalog() {
     cat <<'CATALOG'
 ask 'TASK'|Run a local forensic workflow described in plain English
@@ -98,6 +113,8 @@ help|Show this help
 CATALOG
 }
 
+# first_runnable_module_name: Pick an example module.
+# Prefer passive/low-risk metadata; otherwise use the first script found.
 first_runnable_module_name() {
     local module_yaml module_dir
     local fallback=""
@@ -118,6 +135,8 @@ first_runnable_module_name() {
     printf '%s\n' "$fallback"
 }
 
+# profile_names: Find saved profiles.
+# List immediate profiles/*.yaml names without their extension.
 profile_names() {
     local profile_file
     [[ -d "$PROFILES_DIR" ]] || return 0
@@ -129,6 +148,8 @@ profile_names() {
     )
 }
 
+# usage: Show commands and examples.
+# Combine static commands with discovered modules, profiles, and launchers.
 usage() {
     local command_name description record path kind name
     local module_example=""
@@ -200,6 +221,8 @@ usage() {
     printf '  offensivectl status --strict\n'
 }
 
+# workspace_dir_class: Label directory purpose.
+# Classify a basename as framework, runtime, managed, archive, or other.
 workspace_dir_class() {
     case "$1" in
         bin|sbin|core|modules|services|interfaces|integrations|config|profiles|\
@@ -222,7 +245,10 @@ workspace_dir_class() {
     esac
 }
 
+# cmd_dirs: List workspace folders.
+# Show immediate visible directories, their classes, paths, and count.
 cmd_dirs() {
+    execution_label "List workspace folders."
     local directory name class
     local count=0
 
@@ -246,6 +272,8 @@ cmd_dirs() {
     printf '\nDiscovered: %s directories\n' "$count"
 }
 
+# interface_search_dirs: Find launcher folders.
+# Emit NUL-separated default and OFFENSIVECTL_INTERFACE_PATH directories.
 interface_search_dirs() {
     local directory
     local -a configured_directories=()
@@ -260,6 +288,8 @@ interface_search_dirs() {
     fi
 }
 
+# dynamic_interface_names: Find executable launchers.
+# Return unique valid executable filenames from configured search folders.
 dynamic_interface_names() {
     local directory candidate name
 
@@ -274,6 +304,8 @@ dynamic_interface_names() {
     done < <(interface_search_dirs) | LC_ALL=C sort -zu
 }
 
+# runnable_interface_names: Collect available launcher names.
+# Combine resolvable canonical interfaces and dynamic launcher names.
 runnable_interface_names() {
     local name
     local -a core_names=(control-plane dashboard bettercap-tui scapy-tui)
@@ -286,6 +318,8 @@ runnable_interface_names() {
     } | LC_ALL=C sort -zu
 }
 
+# resolve_dynamic_interface: Locate requested launcher.
+# Print exec|PATH for the first matching executable; return 1 if absent.
 resolve_dynamic_interface() {
     local name="$1"
     local directory candidate
@@ -301,6 +335,8 @@ resolve_dynamic_interface() {
     return 1
 }
 
+# resolve_interface: Locate requested interface.
+# Resolve aliases and built-in candidates, then fall back to dynamic lookup.
 resolve_interface() {
     local name="$1"
     local candidate
@@ -343,6 +379,8 @@ resolve_interface() {
     resolve_dynamic_interface "$name"
 }
 
+# interface_kind: Identify interface type.
+# Use canonical labels or OFFENSIVECTL_KIND metadata; default to launcher.
 interface_kind() {
     local name="$1"
     local path="$2"
@@ -369,6 +407,8 @@ interface_kind() {
     printf '%s\n' "$kind"
 }
 
+# list_operator_interfaces: Show interfaces and availability.
+# Report candidate paths and desktop resources; presence is not a health test.
 list_operator_interfaces() {
     local name kind record path state
     local -a names=(
@@ -416,6 +456,8 @@ list_operator_interfaces() {
     fi
 }
 
+# list_network_interfaces: Show local network connections.
+# Read sysfs and ip output; mark the default-route device without changing it.
 list_network_interfaces() {
     local sys_class_net="${OFFENSIVECTL_SYS_CLASS_NET:-/sys/class/net}"
     local interface_path name state kind address ipv4 default_interface=""
@@ -467,7 +509,10 @@ list_network_interfaces() {
     return 0
 }
 
+# cmd_interfaces: List or launch interfaces.
+# Use list, network/net, or run NAME; exec forwards arguments to the interface.
 cmd_interfaces() {
+    execution_label "List or launch interfaces."
     local action="${1:-list}"
     [[ $# -gt 0 ]] && shift
 
@@ -524,7 +569,10 @@ HELP
     esac
 }
 
+# cmd_discover: Show workspace inventory.
+# Combine folders, module counts, profiles, plugin names, and interfaces.
 cmd_discover() {
+    execution_label "Show workspace inventory."
     local profile_file plugin_manifest
     cmd_dirs
     printf '\nModules\n=======\n'
@@ -548,6 +596,8 @@ cmd_discover() {
     list_network_interfaces
 }
 
+# require_option_value: Check required option value.
+# Reject empty values with status 2; does not validate the value type.
 require_option_value() {
     local option="$1"
     local value="${2:-}"
@@ -557,6 +607,8 @@ require_option_value() {
     }
 }
 
+# config_env_value: Read configuration value.
+# Extract a simple assignment without sourcing or executing the file.
 config_env_value() {
     local key="$1"
     local file="$2"
@@ -566,6 +618,8 @@ config_env_value() {
         "$file" | head -n 1
 }
 
+# http_status_code: Check HTTP response.
+# Discard response body and print curl status with connection/total timeouts.
 http_status_code() {
     local url="$1"
     local timeout_seconds="$2"
@@ -578,7 +632,10 @@ http_status_code() {
         "$url" 2>/dev/null
 }
 
+# cmd_status: Check service availability.
+# Check configured HTTP endpoints; --strict fails when any are unavailable.
 cmd_status() {
+    execution_label "Check service availability."
     local strict=false
     local timeout_seconds="${OFFENSIVECTL_STATUS_TIMEOUT:-2}"
     local api_config="${OMNISCIENT_API_CONFIG:-${HOME:-}/omniscient-operations-console/config/omniscient-api.env}"
@@ -676,6 +733,8 @@ HELP
     [[ "$strict" == "false" || "$unavailable" -eq 0 ]]
 }
 
+# yaml_value: Read module or profile setting.
+# Extract one top-level scalar line; this is not a complete YAML parser.
 yaml_value() {
     local key="$1"
     local file="$2"
@@ -686,12 +745,16 @@ yaml_value() {
         | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' || true
 }
 
+# module_manifest_files: Find module descriptions.
+# Emit sorted NUL-separated module.yaml paths at find depths 3 through 8.
 module_manifest_files() {
     [[ -d "$MODULES_DIR" ]] || return 0
     find -P "$MODULES_DIR" -mindepth 3 -maxdepth 8 -type f \
         -name module.yaml -print0 2>/dev/null | LC_ALL=C sort -z
 }
 
+# module_candidate_dirs: Find possible module folders.
+# Find parent folders of module.yaml or module.sh at depths 3 through 8.
 module_candidate_dirs() {
     [[ -d "$MODULES_DIR" ]] || return 0
     find -P "$MODULES_DIR" -mindepth 3 -maxdepth 8 -type f \
@@ -699,12 +762,16 @@ module_candidate_dirs() {
         | LC_ALL=C sort -zu
 }
 
+# module_name_from_dir: Convert folder path to module name.
+# Remove the modules root and replace path separators with dots.
 module_name_from_dir() {
     local module_dir="$1"
     local relative="${module_dir#"$MODULES_DIR"/}"
     printf '%s\n' "${relative//\//.}"
 }
 
+# count_runnable_modules: Count modules with scripts.
+# Count discovered manifests with module.sh; dependencies are not tested.
 count_runnable_modules() {
     local module_yaml module_dir
     local count=0
@@ -716,6 +783,8 @@ count_runnable_modules() {
     printf '%s\n' "$count"
 }
 
+# validate_case_id: Check case name.
+# Require CASE- plus allowed characters; reject traversal and exit on failure.
 validate_case_id() {
     local case_id="$1"
 
@@ -730,6 +799,8 @@ validate_case_id() {
     }
 }
 
+# validate_profile_name: Check profile name.
+# Allow letters, numbers, dots, underscores, and dashes; reject traversal.
 validate_profile_name() {
     local profile="$1"
 
@@ -743,6 +814,8 @@ validate_profile_name() {
     }
 }
 
+# module_dir_for_name: Resolve module location.
+# Convert dotted names to paths and require canonical containment in modules/.
 module_dir_for_name() {
     local module_name="$1"
     local module_root
@@ -774,6 +847,8 @@ module_dir_for_name() {
     esac
 }
 
+# validate_scope_membership: Check target against scope list.
+# When supplied, require a scope file containing the exact target line.
 validate_scope_membership() {
     local target="$1"
     local scope_file="$2"
@@ -786,7 +861,10 @@ validate_scope_membership() {
     }
 }
 
+# cmd_list: Show registered modules.
+# Group discovered manifests by category and flag missing module scripts.
 cmd_list() {
+    execution_label "Show registered modules."
     echo "Available Modules"
     echo "================="
     echo ""
@@ -820,7 +898,10 @@ cmd_list() {
     return 0
 }
 
+# cmd_run: Validate request and run module.
+# Require module, case, target, and authorization; forward options through Bash.
 cmd_run() {
+    execution_label "Validate request and run module."
     local module_path=""
     local case_id=""
     local target=""
@@ -941,7 +1022,10 @@ HELP
     bash "${cmd[@]}"
 }
 
+# cmd_profile: Run profile modules in order.
+# Validate common inputs and scope; continue after failed or missing scripts.
 cmd_profile() {
+    execution_label "Run profile modules in order."
     local profile=""
     local target=""
     local case_id=""
@@ -1065,7 +1149,10 @@ HELP
     [[ "$failed_modules" -eq 0 ]]
 }
 
+# cmd_report: Generate report or list case folders.
+# Use the case-report helper when present; otherwise list case subdirectories.
 cmd_report() {
+    execution_label "Generate report or list case folders."
     local case_id=""
 
     while [[ $# -gt 0 ]]; do
@@ -1121,7 +1208,10 @@ HELP
     fi
 }
 
+# cmd_doctor: Check installation files and paths.
+# Check directories, entrypoint, deployed copy, and module file pairs.
 cmd_doctor() {
+    execution_label "Check installation files and paths."
     local failures=0
 
     echo "offensivectl Doctor"
@@ -1220,6 +1310,8 @@ cmd_doctor() {
     [[ "$failures" -eq 0 ]]
 }
 
+# resolve_kali_ones_bin: Locate Kali command helper.
+# Use the override, known installation paths, or a bounded workspace search.
 resolve_kali_ones_bin() {
     local candidate
     if [[ -n "${OFFENSIVECTL_KALI_ONES_BIN:-}" ]]; then
@@ -1238,6 +1330,8 @@ resolve_kali_ones_bin() {
         -name kali-ones-offensive -perm -u+x -print -quit 2>/dev/null
 }
 
+# show_kali_ones_help: Show Kali command usage.
+# Describe help, list, run, and direct forwarding syntax.
 show_kali_ones_help() {
     cat <<'EOF'
 Usage: offensivectl kali <command> [args...]
@@ -1256,6 +1350,8 @@ Examples:
 EOF
 }
 
+# list_kali_one_liners: Show helper commands.
+# Run the executable helper through Bash with --help, falling back to help.
 list_kali_one_liners() {
     local kali_bin="$1"
     if [[ -x "$kali_bin" ]]; then
@@ -1266,7 +1362,10 @@ list_kali_one_liners() {
     fi
 }
 
+# cmd_kali_ones: Run requested Kali helper command.
+# Resolve the helper and forward list/run/direct commands without case checks.
 cmd_kali_ones() {
+    execution_label "Run requested Kali helper command."
     local action="${1:-help}"
     shift || true
 
@@ -1297,6 +1396,8 @@ cmd_kali_ones() {
     esac
 }
 
+# resolve_lms_helper: Locate LM Studio helper.
+# Prefer the explicit executable override, then known paths and bounded search.
 resolve_lms_helper() {
     local candidate
     if [[ -n "${OFFENSIVECTL_LMS_SCRIPT:-}" ]]; then
@@ -1315,7 +1416,10 @@ resolve_lms_helper() {
         -print -quit 2>/dev/null
 }
 
+# cmd_lms: Handle LM Studio request.
+# Route server/model actions to the helper; models/test call the HTTP API.
 cmd_lms() {
+    execution_label "Handle LM Studio request."
     local action="${1:-status}"
     local base_url="${LMS_BASE_URL:-http://127.0.0.1:1234}"
     local lms_script=""
@@ -1373,7 +1477,10 @@ HELP
     esac
 }
 
+# cmd_vuln: Route local vulnerability research.
+# Map case, target, inspection, crash, assessment, and report actions to cmd_run.
 cmd_vuln() {
+    execution_label "Route local vulnerability research."
     local area="${1:-help}"
     [[ $# -gt 0 ]] && shift
 
@@ -1481,7 +1588,10 @@ HELP
     esac
 }
 
+# cmd_registry: Handle module index request.
+# rebuild overwrites modules.tsv; show displays the existing snapshot.
 cmd_registry() {
+    execution_label "Handle module index request."
     local action="${1:-help}"
     shift || true
 
@@ -1553,7 +1663,10 @@ HELP
     esac
 }
 
+# cmd_results: Handle saved results.
+# List or delete quick outputs; existing listing and clean bugs remain unchanged.
 cmd_results() {
+    execution_label "Handle saved results."
     local action="${1:-list}"
     local results_dir="$ROOT_DIR/results"
 
@@ -1573,6 +1686,7 @@ cmd_results() {
                     "$(date -r "$file" '+%Y-%m-%d %H:%M:%S')" \
                     "$(stat -c '%s' "$file")" \
                     "${file#$ROOT_DIR/}"
+            # Existing defect: read expects NUL, but this producer emits newlines.
             done < <(find "$results_dir" -maxdepth 1 -type f | LC_ALL=C sort)
             ;;
         delete)
@@ -1581,6 +1695,7 @@ cmd_results() {
                 return 2
             fi
             local target="$2"
+            # Existing limitation: target is not confined against path traversal.
             local path="$results_dir/$target"
             if [[ ! -f "$path" ]]; then
                 echo "Result file not found: $target" >&2
@@ -1590,6 +1705,7 @@ cmd_results() {
             echo "Deleted $target"
             ;;
         clean)
+            # Existing defect: action was not shifted; clean is rejected by the loop.
             local older_than=30
             while [[ $# -gt 0 ]]; do
                 case "$1" in
@@ -1650,7 +1766,10 @@ HELP
 # ──────────────────────────────────────────────
 # AI sub-command: delegate to offensive-ai
 # ──────────────────────────────────────────────
+# cmd_ai: Forward request to AI helper.
+# Show advertised actions or exec offensive-ai; early guide/summarize bypass this.
 cmd_ai() {
+    execution_label "Forward request to AI helper."
     local ai_bin="$OFFENSIVE_BIN/offensive-ai"
     if [[ ! -x "$ai_bin" ]]; then
         echo -e "${RED}[ERROR]${NC} offensive-ai not found at $ai_bin" >&2
@@ -1682,7 +1801,10 @@ cmd_ai() {
 # ──────────────────────────────────────────────
 # Quick one-liner workflows
 # ──────────────────────────────────────────────
+# cmd_quick: Run selected quick workflow.
+# Collect tool output; optionally save it and request an AI summary.
 cmd_quick() {
+    execution_label "Run selected quick workflow."
     # Handle --help before anything
     for arg in "$@"; do
         if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
@@ -1717,6 +1839,7 @@ HELP
         fi
     done
 
+    # Quick workflows do not use cmd_run case, scope, or authorization checks.
     local workflow="${1:-}"
     shift || true
 
@@ -1967,6 +2090,8 @@ HELP
     fi
 }
 
+# main: Route command to selected handler.
+# Dispatch built-ins and launchers; qualifying unknown input reaches the assistant.
 main() {
     if [[ $# -eq 0 && -t 0 ]]; then
         exec /usr/bin/env python3 "$ROOT_DIR/forensic_assistant.py" chat
@@ -2059,4 +2184,3 @@ main() {
 }
 
 main "$@"
-
